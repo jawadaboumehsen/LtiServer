@@ -1,0 +1,23 @@
+# Gradle / Kotlin
+.gradle/
+build/
+.kotlin/
+out/
+bin/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Local state and logs
+local.properties
+*.log
+hs_err_pid*
+*.backup
+*.orig
+*.rej
+
+# OS
+.DS_Store
+Thumbs.db
