@@ -13,8 +13,9 @@ public sealed interface Hold {
     }
 
     @Serializable
-    public data class Activation(val requestId: String) : Hold {
-        override val label: String get() = "ACTIVATION($requestId)"
+    public data object ClientLifecycle : Hold {
+        override val label: String get() = "CLIENT_LIFECYCLE"
         override fun toString(): String = label
     }
+
 }

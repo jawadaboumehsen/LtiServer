@@ -8,6 +8,7 @@ import io.ktor.server.plugins.contentnegotiation.*
 import io.ktor.server.plugins.cors.routing.*
 import io.ktor.server.websocket.*
 import io.ltirom.server.core.LinuxProcessRunner
+import io.ltirom.server.engine.cancelWorkWithin
 import io.ltirom.server.core.LinuxToolResolver
 import io.ltirom.server.routing.ServerConfiguration
 import io.ltirom.server.routing.configureRoutes
@@ -20,9 +21,8 @@ public fun main(args: Array<String>) {
     var port = 0
     var host = "0.0.0.0"
     var token: String? = null
-    var toolsDir = File(System.getProperty("user.home"), ".ltirom/bin")
+    var toolsDir = File(System.getProperty("user.home"), "LtiRomTools/bin")
     var distroName = System.getenv("WSL_DISTRO_NAME") ?: "Ubuntu"
-    var toolchainLayoutV2 = false
 
     var i = 0
     while (i < args.size) {
@@ -32,25 +32,8 @@ public fun main(args: Array<String>) {
             "--token", "-t" -> { if (i + 1 < args.size) token = args[++i] }
             "--tools-dir", "-d" -> { if (i + 1 < args.size) toolsDir = File(args[++i]) }
             "--distro" -> { if (i + 1 < args.size) distroName = args[++i] }
-            "--toolchain-layout-v2" -> {
-                if (i + 1 < args.size && (args[i + 1] == "true" || args[i + 1] == "false")) {
-                    toolchainLayoutV2 = args[++i].toBoolean()
-                } else {
-                    toolchainLayoutV2 = true
-                }
-            }
         }
         i++
-    }
-
-    if (toolchainLayoutV2) {
-        val toolsHome = File(System.getProperty("user.home"), "LtiRomTools")
-        val legacyBinDir = File(toolsHome, "bin")
-        if (legacyBinDir.exists() && !java.nio.file.Files.isSymbolicLink(legacyBinDir.toPath())) {
-            throw IllegalStateException(
-                "Startup failed: ~/LtiRomTools/bin exists but is a directory, not a managed toolchain symlink. Unsupported legacy layout."
-            )
-        }
     }
 
     if (token == null || token.isBlank()) {
@@ -59,57 +42,38 @@ public fun main(args: Array<String>) {
 
     val baseResolver = LinuxToolResolver(toolsBinDir = toolsDir)
     val toolResolver = io.ltirom.server.infra.DynamicToolRegistry(fallbackResolver = baseResolver)
-    val processRunner = LinuxProcessRunner(toolResolver)
+    val processRunner = LinuxProcessRunner(resolver = toolResolver)
 
-    val stateDir = File(System.getProperty("user.home"), ".ltirom")
-    val toolsHome = File(System.getProperty("user.home"), "LtiRomTools")
-    val journal = if (toolchainLayoutV2) io.ltirom.server.toolchain.ToolchainJournal(stateDir) else null
-    val stateMachine = if (journal != null) io.ltirom.server.toolchain.JournalToolchainStateMachine(journal) else null
     val engine = io.ltirom.server.engine.DefaultServerEngine(
         toolResolver = toolResolver,
         processRunner = processRunner,
         distroName = distroName,
         sessionManager = io.ltirom.server.session.ExecutionSessionManager(autoRehydrate = true),
-        toolchainStateMachine = stateMachine
     )
-    val osArch = System.getProperty("os.arch").lowercase()
-    val arch = when {
-        osArch == "amd64" || osArch == "x86_64" -> "x86_64"
-        osArch == "aarch64" || osArch == "arm64" -> "aarch64"
-        else -> osArch
-    }
-    val validator = io.ltirom.server.toolchain.InstallValidator(
-        toolsDir = toolsHome,
-        serviceDistro = distroName,
-        serviceArch = arch
+    engine.addHold(io.ltirom.server.engine.Hold.ClientLifecycle)
+    val watchdog = io.ltirom.server.engine.ClientWatchdog(
+        cancelAllWork = {
+            // Close the engine admission gate before collecting work. This is
+            // atomic with run/direct-command admission, so no command can
+            // appear in the check-to-cancel gap.
+            val active = engine.closeAdmission(force = true)
+            engine.cancelWorkWithin(active, CANCEL_BUDGET_MS)
+            active
+        },
+        activeWorkProvider = {
+            engine.activeWork()
+        },
+        onAdmissionOpened = {
+            engine.reopenAdmission()
+        }
     )
-    val activator = if (toolchainLayoutV2 && journal != null) {
-        io.ltirom.server.toolchain.ToolchainActivator(
-            toolsDir = toolsHome,
-            stateDir = stateDir,
-            journal = journal,
-            validator = validator,
-            tryAddHold = { engine.tryAddHold(it) },
-            holdRemover = { engine.removeHold(it) },
-            verifyProvider = { targetInstallId ->
-                io.ltirom.server.toolchain.ToolchainActivator.verifyInstall(
-                    toolsDir = toolsHome,
-                    targetInstallId = targetInstallId,
-                    registry = toolResolver,
-                    runner = processRunner
-                )
-            }
-        ).also { it.recoverStartup() }
-    } else null
 
     val config = ServerConfiguration(
         authToken = token,
         distroName = distroName,
         engine = engine,
-        toolchainLayoutV2 = toolchainLayoutV2,
-        activator = activator,
-        journal = journal,
-        toolResolver = toolResolver
+        toolResolver = toolResolver,
+        watchdog = watchdog
     )
 
     val server = embeddedServer(CIO, port = port, host = host) {
@@ -146,9 +110,11 @@ public fun main(args: Array<String>) {
     System.out.flush()
 
     Runtime.getRuntime().addShutdownHook(Thread {
-        stateStore.deleteState()
+        stateStore.deleteState(pid)
         server.stop(1000, 2000)
     })
 
     Thread.currentThread().join()
 }
+
+private const val CANCEL_BUDGET_MS = 5_000L

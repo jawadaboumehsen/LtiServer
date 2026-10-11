@@ -34,7 +34,8 @@ class ServerUseCasesTest {
             environment: Map<String, String>,
             stdinText: String?,
             timeoutMs: Long,
-            onOutput: ((stdoutLine: String, stderrLine: String) -> Unit)?
+            onOutput: ((stdoutLine: String, stderrLine: String) -> Unit)?,
+            executionId: String?
         ): ProcessExecutionResult {
             onOutput?.invoke(stdout, stderr)
             return ProcessExecutionResult(exitCode, stdout, stderr, durationMs)

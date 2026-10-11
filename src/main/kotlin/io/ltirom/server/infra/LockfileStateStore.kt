@@ -13,11 +13,25 @@ public class LockfileStateStore(
         runCatching {
             stateFile.parentFile?.mkdirs()
             val jsonText = """{"port":$port,"token":"$token","pid":$pid,"distro":"$distro","startTimeEpochMs":${System.currentTimeMillis()}}"""
-            stateFile.writeText(jsonText)
+            // Atomic: the app reads this file at any moment, and a half-written one reads as "no service".
+            val tmp = File(stateFile.path + ".tmp")
+            tmp.writeText(jsonText)
+            java.nio.file.Files.move(
+                tmp.toPath(),
+                stateFile.toPath(),
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+            )
         }
     }
 
-    public fun deleteState() {
-        runCatching { stateFile.delete() }
+    /**
+     * Deletes the file only while it still names [pid]. A retired service used to delete the file a newer
+     * service had already written, so the app found no service and launched yet another one.
+     */
+    public fun deleteState(pid: Long) {
+        runCatching {
+            if (stateFile.readText().contains("\"pid\":$pid,")) stateFile.delete()
+        }
     }
 }

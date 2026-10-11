@@ -40,6 +40,7 @@ class ServerAdmissionTest {
             stdinText: String?,
             timeoutMs: Long,
             onOutput: ((stdoutLine: String, stderrLine: String) -> Unit)?,
+            executionId: String?
         ): ProcessExecutionResult = awaitCancellation()
     }
 

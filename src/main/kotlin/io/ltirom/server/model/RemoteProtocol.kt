@@ -53,7 +53,9 @@ public data class WslServerInfo(
     val availableTools: List<String> = emptyList(),
     val activeRuns: Int = 0,
     val protocolVersion: String = "1.2.0",
-    val serverVersion: String? = null
+    val serverVersion: String? = null,
+    /** Ids of the work this service still tracks (runs, direct commands, processes it could not confirm ended). */
+    val activeWork: List<String>? = null
 )
 
 
@@ -141,44 +143,4 @@ public data class SessionSummary(
 public data class SequencedStreamEvent(
     val seq: Long,
     val event: StreamEvent
-)
-
-@Serializable
-public data class ActivateToolchainRequest(
-    val activationRequestId: String,
-    val expectedActiveInstallId: String? = null,
-    val targetInstallId: String? = null
-)
-
-@Serializable
-public data class ActivateToolchainResponse(
-    val state: String? = null,
-    val activeInstallId: String? = null,
-    val code: String? = null,
-    val reason: String? = null,
-    val actual: String? = null,
-    val activeWork: Int? = null,
-    val toolIds: List<String>? = null
-)
-
-@Serializable
-public data class ToolchainStateResponse(
-    val state: String,
-    val activeInstallId: String? = null,
-    val previousInstallId: String? = null,
-    val holds: List<String> = emptyList(),
-    val lastActivation: LastActivationSummary? = null,
-    val health: ToolchainHealthSummary? = null
-)
-
-@Serializable
-public data class LastActivationSummary(
-    val requestId: String,
-    val state: String
-)
-
-@Serializable
-public data class ToolchainHealthSummary(
-    val intact: Boolean,
-    val resolves: Boolean
 )

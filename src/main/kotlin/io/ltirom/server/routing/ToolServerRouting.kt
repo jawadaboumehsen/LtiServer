@@ -1,5 +1,6 @@
 package io.ltirom.server.routing
 
+import io.ltirom.server.engine.cancelWorkAndWait
 import io.ktor.http.*
 import io.ktor.server.application.*
 import io.ktor.server.request.*
@@ -21,7 +22,6 @@ import io.ltirom.server.infra.resolveTraceId
 
 import io.ktor.utils.io.jvm.javaio.copyTo
 
-import io.ltirom.server.toolchain.*
 
 public class ServerConfiguration(
     public val authToken: String,
@@ -30,11 +30,8 @@ public class ServerConfiguration(
     public val allowedBaseDirs: List<java.io.File>? = null,
     public val heartbeatIntervalMs: Long = 15_000L,
     public val exitOnShutdown: Boolean = true,
-    public val toolchainLayoutV2: Boolean = false,
-    public val activator: ToolchainActivator? = null,
-    public val journal: ToolchainJournal? = null,
-    public val stateMachine: ToolchainStateMachine? = null,
-    public val toolResolver: ToolResolverPort? = null
+    public val toolResolver: ToolResolverPort? = null,
+    public val watchdog: io.ltirom.server.engine.ClientWatchdog? = null
 ) {
     public constructor(
         authToken: String,
@@ -46,10 +43,7 @@ public class ServerConfiguration(
         allowedBaseDirs: List<java.io.File>? = null,
         heartbeatIntervalMs: Long = 15_000L,
         exitOnShutdown: Boolean = true,
-        toolchainLayoutV2: Boolean = false,
-        activator: ToolchainActivator? = null,
-        journal: ToolchainJournal? = null,
-        stateMachine: ToolchainStateMachine? = null
+        watchdog: io.ltirom.server.engine.ClientWatchdog? = null
     ) : this(
         authToken = authToken,
         distroName = distroName,
@@ -63,11 +57,8 @@ public class ServerConfiguration(
         allowedBaseDirs = allowedBaseDirs,
         heartbeatIntervalMs = heartbeatIntervalMs,
         exitOnShutdown = exitOnShutdown,
-        toolchainLayoutV2 = toolchainLayoutV2,
-        activator = activator,
-        journal = journal,
-        stateMachine = stateMachine,
-        toolResolver = toolResolver
+        toolResolver = toolResolver,
+        watchdog = watchdog
     )
 
     public constructor(
@@ -81,11 +72,8 @@ public class ServerConfiguration(
         allowedBaseDirs: List<java.io.File>? = null,
         heartbeatIntervalMs: Long = 15_000L,
         exitOnShutdown: Boolean = true,
-        toolchainLayoutV2: Boolean = false,
-        activator: ToolchainActivator? = null,
-        journal: ToolchainJournal? = null,
-        stateMachine: ToolchainStateMachine? = null,
-        toolResolver: ToolResolverPort? = null
+        toolResolver: ToolResolverPort? = null,
+        watchdog: io.ltirom.server.engine.ClientWatchdog? = null
     ) : this(
         authToken = authToken,
         distroName = distroName,
@@ -99,11 +87,8 @@ public class ServerConfiguration(
         allowedBaseDirs = allowedBaseDirs,
         heartbeatIntervalMs = heartbeatIntervalMs,
         exitOnShutdown = exitOnShutdown,
-        toolchainLayoutV2 = toolchainLayoutV2,
-        activator = activator,
-        journal = journal,
-        stateMachine = stateMachine,
-        toolResolver = toolResolver
+        toolResolver = toolResolver,
+        watchdog = watchdog
     )
 }
 
@@ -118,6 +103,10 @@ private fun expandHome(pathStr: String): String {
         else -> pathStr
     }
 }
+
+/** Constant-time comparison, so the token cannot be guessed from how long a wrong one takes to be refused. */
+private fun sameToken(given: String?, expected: String): Boolean =
+    given != null && java.security.MessageDigest.isEqual(given.toByteArray(), expected.toByteArray())
 
 private fun resolveAllowedRoots(configuredDirs: List<java.io.File>?): List<java.nio.file.Path> {
     val homeDir = java.nio.file.Paths.get(
@@ -165,7 +154,9 @@ public fun Application.configureRoutes(config: ServerConfiguration) {
                     (call.request.uri.contains("/tools/execute/") && call.request.uri.endsWith("/cancel"))) {
                     call.response.headers.append("Deprecation", "true")
                 }
-                if (call.request.uri.endsWith("/health")) {
+                // The one open endpoint, matched on the parsed path only. (Testing the raw URI's suffix also matched
+                // "...?x=/health" and let any endpoint be called without a token.)
+                if (call.request.httpMethod == HttpMethod.Get && call.request.path() == "/api/v1/health") {
                     return@intercept
                 }
                 val protocolVersion = call.request.header("X-LtiRom-Protocol-Version")
@@ -177,7 +168,7 @@ public fun Application.configureRoutes(config: ServerConfiguration) {
                 val header = call.request.header("Authorization")
                 val tokenFromHeader = header?.removePrefix("Bearer ")?.trim()
                 val tokenFromQuery = call.request.queryParameters["token"]
-                val valid = (tokenFromHeader == config.authToken) || (tokenFromQuery == config.authToken)
+                val valid = sameToken(tokenFromHeader, config.authToken) || sameToken(tokenFromQuery, config.authToken)
                 if (!valid) {
                     call.respond(HttpStatusCode.Unauthorized, "Invalid or missing Bearer authorization token")
                     finish()
@@ -192,20 +183,43 @@ public fun Application.configureRoutes(config: ServerConfiguration) {
                 call.respond(config.engine.refreshTools())
             }
 
+            post("/client/heartbeat") {
+                val ok = config.watchdog?.recordHeartbeat() ?: true
+                if (ok) {
+                    call.respond(HttpStatusCode.NoContent)
+                } else {
+                    val code = when (config.watchdog?.admissionState) {
+                        io.ltirom.server.engine.WatchdogAdmissionState.STOPPING -> "SERVER_STOPPING"
+                        io.ltirom.server.engine.WatchdogAdmissionState.CANCELLING -> "CANCELLATION_IN_PROGRESS"
+                        else -> "HEARTBEAT_REJECTED"
+                    }
+                    call.response.header("X-LtiRom-Error-Code", code)
+                    call.respond(HttpStatusCode.Conflict, "Cannot record heartbeat: $code")
+                }
+            }
+
+            post("/client/stop") {
+                val result = config.watchdog?.stop() ?: io.ltirom.server.engine.StopResult(stopped = true)
+                call.respond(HttpStatusCode.OK, result)
+            }
+
             post("/runs") {
+                if (config.watchdog != null && !config.watchdog.isAdmissionOpen) {
+                    val code = when (config.watchdog.admissionState) {
+                        io.ltirom.server.engine.WatchdogAdmissionState.STOPPING -> "SERVER_STOPPING"
+                        io.ltirom.server.engine.WatchdogAdmissionState.CANCELLING -> "CANCELLATION_IN_PROGRESS"
+                        else -> "CLIENT_HEARTBEAT_REQUIRED"
+                    }
+                    call.response.header("X-LtiRom-Error-Code", code)
+                    call.respond(HttpStatusCode.ServiceUnavailable, "Command admission is closed; client heartbeat required")
+                    return@post
+                }
                 val request = call.receive<StartRunRequest>()
                 when (val outcome = config.engine.startRun(request)) {
                     is RunStartOutcome.Created -> call.respond(HttpStatusCode.Created, outcome.handle)
                     is RunStartOutcome.Existing -> call.respond(HttpStatusCode.OK, outcome.handle)
                     is RunStartOutcome.Conflict -> call.respond(HttpStatusCode.Conflict, outcome.conflict)
                     is RunStartOutcome.InvalidCwd -> call.respond(HttpStatusCode(422, "Unprocessable Entity"), outcome.error)
-                    is RunStartOutcome.ToolchainNotReady ->
-                        call.respond(HttpStatusCode.ServiceUnavailable, ProblemDetails(
-                            type = "https://ltirom.io/errors/${outcome.errorCode.lowercase()}",
-                            title = outcome.errorCode,
-                            status = 503,
-                            detail = "Toolchain is not ready: ${outcome.errorCode}"
-                        ))
                     RunStartOutcome.ShuttingDown ->
                         call.respond(HttpStatusCode.ServiceUnavailable, "The build service is shutting down")
                 }
@@ -268,12 +282,26 @@ public fun Application.configureRoutes(config: ServerConfiguration) {
 
 
             post("/tools/execute") {
+                if (config.watchdog != null && !config.watchdog.isAdmissionOpen) {
+                    val code = when (config.watchdog.admissionState) {
+                        io.ltirom.server.engine.WatchdogAdmissionState.STOPPING -> "SERVER_STOPPING"
+                        io.ltirom.server.engine.WatchdogAdmissionState.CANCELLING -> "CANCELLATION_IN_PROGRESS"
+                        else -> "CLIENT_HEARTBEAT_REQUIRED"
+                    }
+                    call.response.header("X-LtiRom-Error-Code", code)
+                    call.respond(HttpStatusCode.ServiceUnavailable, "Command admission is closed; client heartbeat required")
+                    return@post
+                }
                 val request = call.receive<ToolExecutionRequest>()
                 val traceId = call.request.header("X-Trace-Id")
                 val response = try {
                     config.engine.execute(request, traceId)
                 } catch (e: io.ltirom.server.engine.ServiceShuttingDownException) {
                     return@post call.respond(HttpStatusCode.ServiceUnavailable, e.message.orEmpty())
+                } catch (e: io.ltirom.server.engine.InvalidExecutionIdException) {
+                    return@post call.respond(HttpStatusCode.BadRequest, e.message.orEmpty())
+                } catch (e: io.ltirom.server.engine.DuplicateExecutionException) {
+                    return@post call.respond(HttpStatusCode.Conflict, e.message.orEmpty())
                 }
                 call.respond(response)
             }
@@ -286,11 +314,14 @@ public fun Application.configureRoutes(config: ServerConfiguration) {
                     return@post call.respond(HttpStatusCode.BadRequest, "Missing executionId")
                 }
                 val signal = call.request.queryParameters["signal"] ?: "SIGTERM"
-                val cancelled = config.engine.cancel(executionId, signal)
+                // The legacy port is blocking; do not occupy the HTTP event loop while observing exit.
+                val cancelled = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    config.engine.cancel(executionId, signal)
+                }
                 call.respond(ProcessCancellationResponse(
                     success = cancelled,
                     executionId = executionId,
-                    message = if (cancelled) "Signal $signal dispatched to process $executionId" else "Process $executionId not found or already terminated"
+                    message = if (cancelled) "Process $executionId and tracked descendants confirmed terminated" else "Termination of process $executionId not confirmed (unknown ID, cancellation failure, or acknowledgement deadline expired)"
                 ))
             }
 
@@ -321,6 +352,15 @@ public fun Application.configureRoutes(config: ServerConfiguration) {
             }
 
             webSocket("/tools/stream") {
+                if (config.watchdog != null && !config.watchdog.isAdmissionOpen) {
+                    val reasonText = when (config.watchdog.admissionState) {
+                        io.ltirom.server.engine.WatchdogAdmissionState.STOPPING -> "SERVER_STOPPING"
+                        io.ltirom.server.engine.WatchdogAdmissionState.CANCELLING -> "CANCELLATION_IN_PROGRESS"
+                        else -> "CLIENT_HEARTBEAT_REQUIRED"
+                    }
+                    close(CloseReason(CloseReason.Codes.VIOLATED_POLICY, reasonText))
+                    return@webSocket
+                }
                 call.application.environment.log.warn("WebSocket /api/v1/tools/stream is deprecated in v1.2.0; use POST /api/v1/runs and WS /api/v1/runs/{runId}/attach instead")
                 val traceId = call.request.queryParameters["traceId"]
                 val sessionId = call.request.queryParameters["sessionId"]
@@ -342,6 +382,10 @@ public fun Application.configureRoutes(config: ServerConfiguration) {
                                 close()
                             } catch (e: io.ltirom.server.engine.ServiceShuttingDownException) {
                                 close(CloseReason(CloseReason.Codes.TRY_AGAIN_LATER, e.message.orEmpty()))
+                            } catch (e: io.ltirom.server.engine.InvalidExecutionIdException) {
+                                close(CloseReason(CloseReason.Codes.CANNOT_ACCEPT, e.message.orEmpty()))
+                            } catch (e: io.ltirom.server.engine.DuplicateExecutionException) {
+                                close(CloseReason(CloseReason.Codes.CANNOT_ACCEPT, e.message.orEmpty()))
                             }
                             return@webSocket
                         }
@@ -353,22 +397,14 @@ public fun Application.configureRoutes(config: ServerConfiguration) {
                 val rawDestPath = call.request.queryParameters["path"]
                     ?: return@post call.respond(HttpStatusCode.BadRequest, "Missing 'path' query parameter")
                 val destPath = expandHome(rawDestPath)
-                val targetFile = java.io.File(destPath)
-                val parentFile = targetFile.parentFile ?: java.io.File(".")
-                parentFile.mkdirs()
-
-                val realParent = runCatching { parentFile.toPath().toRealPath() }.getOrNull()
-                val realTarget = realParent?.resolve(targetFile.name)?.normalize()
-                if (realTarget == null || allowedRoots.none { realTarget.startsWith(it) }) {
-                    return@post call.respond(HttpStatusCode.Forbidden, "PathNotAllowed")
-                }
+                // Decided without touching the disk: a refused request must not have created anything.
+                val realTarget = io.ltirom.server.infra.planUpload(java.io.File(destPath), allowedRoots)
+                    ?: return@post call.respond(HttpStatusCode.Forbidden, "PathNotAllowed")
 
                 val startTime = System.currentTimeMillis()
                 val channel = call.receiveChannel()
                 val totalBytes = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                    realTarget.toFile().outputStream().use { fos ->
-                        channel.copyTo(fos)
-                    }
+                    io.ltirom.server.infra.writeReplacing(realTarget) { out -> channel.copyTo(out) }
                 }
                 val duration = System.currentTimeMillis() - startTime
                 call.respond(BinaryTransferResponse(path = rawDestPath, bytesTransferred = totalBytes, durationMs = duration))
@@ -396,10 +432,23 @@ public fun Application.configureRoutes(config: ServerConfiguration) {
                 val force = call.request.queryParameters["force"]?.toBooleanStrictOrNull() ?: false
                 // Closing admission and checking for active runs is one atomic step (see closeAdmission).
                 val activeWork = config.engine.closeAdmission(force)
-                if (activeWork.isNotEmpty()) {
+                if (activeWork.isNotEmpty() && !force) {
                     call.respond(
                         HttpStatusCode.Conflict,
                         ActiveRuns(runIds = activeWork, message = "Active runs prevent shutdown")
+                    )
+                    return@post
+                }
+                // Whatever is still running is stopped (and its process tree confirmed gone, within one limit) before
+                // anything is promised: exiting first would leave the children running unmanaged. If some work
+                // cannot be stopped the service stays up, admission stays closed, and the caller is told which.
+                val survivors =
+                    if (activeWork.isEmpty()) emptyList() else config.engine.cancelWorkAndWait(activeWork, SHUTDOWN_STOP_WAIT_MS)
+                if (survivors.isNotEmpty()) {
+                    config.watchdog?.shutdownRefused(survivors)
+                    call.respond(
+                        HttpStatusCode.Conflict,
+                        ActiveRuns(runIds = survivors, message = "Work could not be stopped; the service keeps running")
                     )
                     return@post
                 }
@@ -413,103 +462,11 @@ public fun Application.configureRoutes(config: ServerConfiguration) {
                 }
             }
 
-            if (config.toolchainLayoutV2) {
-                route("/toolchain") {
-                    get("/state") {
-                        val currentJournal = config.journal?.fold()
-                        val stateStr = config.stateMachine?.state?.name ?: currentJournal?.state?.name ?: "UNINITIALIZED"
-                        val activeInstall = currentJournal?.activeInstallId
-                        val previousInstall = currentJournal?.previousInstallId
-                        val holds = config.engine.admissionHolds.map { it.label }
-                        val lastAct = currentJournal?.activations?.values?.lastOrNull()?.let {
-                            LastActivationSummary(it.requestId, it.state.name)
-                        }
-                        val health = ToolchainHealthSummary(
-                            intact = true,
-                            resolves = true
-                        )
-                        call.respond(
-                            ToolchainStateResponse(
-                                state = stateStr,
-                                activeInstallId = activeInstall,
-                                previousInstallId = previousInstall,
-                                holds = holds,
-                                lastActivation = lastAct,
-                                health = health
-                            )
-                        )
-                    }
 
-                    post("/activate") {
-                        val request = call.receive<ActivateToolchainRequest>()
-                        if (request.targetInstallId.isNullOrBlank()) {
-                            call.respond(
-                                HttpStatusCode.UnprocessableEntity,
-                                ActivateToolchainResponse(code = "INVALID_TARGET", reason = "targetInstallId cannot be null or blank")
-                            )
-                            return@post
-                        }
-                        val outcome = config.activator?.activate(
-                            requestId = request.activationRequestId,
-                            expectedActive = request.expectedActiveInstallId,
-                            targetInstallId = request.targetInstallId
-                        ) ?: ActivationOutcome.Rejected("ACTIVATOR_UNAVAILABLE")
-
-                        when (outcome) {
-                            is ActivationOutcome.Committed -> call.respond(
-                                HttpStatusCode.OK,
-                                ActivateToolchainResponse(state = "COMMITTED", activeInstallId = outcome.activeInstallId)
-                            )
-                            is ActivationOutcome.InProgress -> call.respond(
-                                HttpStatusCode.Accepted,
-                                ActivateToolchainResponse(state = "IN_PROGRESS")
-                            )
-                            is ActivationOutcome.Blocked -> call.respond(
-                                HttpStatusCode.Conflict,
-                                ActivateToolchainResponse(code = "BLOCKED", activeWork = outcome.activeWork.size)
-                            )
-                            is ActivationOutcome.Rejected -> {
-                                if (outcome.code == "CONFLICT") {
-                                    call.respond(
-                                        HttpStatusCode.Conflict,
-                                        ActivateToolchainResponse(code = "CONFLICT", actual = outcome.actualActiveInstallId, reason = outcome.reason)
-                                    )
-                                } else if (outcome.code == "BLOCKED") {
-                                    call.respond(
-                                        HttpStatusCode.Conflict,
-                                        ActivateToolchainResponse(code = "BLOCKED")
-                                    )
-                                } else {
-                                    call.respond(
-                                        HttpStatusCode.UnprocessableEntity,
-                                        ActivateToolchainResponse(code = outcome.code, reason = outcome.reason, toolIds = outcome.conflictingToolIds)
-                                    )
-                                }
-                            }
-                            is ActivationOutcome.VerifyFailedRestored -> call.respond(
-                                HttpStatusCode.UnprocessableEntity,
-                                ActivateToolchainResponse(code = "VERIFY_FAILED", reason = outcome.reason, actual = outcome.activeInstallId)
-                            )
-                            is ActivationOutcome.MaintenanceFailed -> call.respond(
-                                HttpStatusCode.ServiceUnavailable,
-                                ActivateToolchainResponse(code = "MAINTENANCE_FAILED", reason = outcome.reason)
-                            )
-                        }
-                    }
-
-                    get("/activations/{id}") {
-                        val id = call.parameters["id"]
-                        val record = if (id != null) config.journal?.fold()?.activations?.get(id) else null
-                        if (record == null) {
-                            call.respond(HttpStatusCode.NotFound)
-                        } else {
-                            call.respond(HttpStatusCode.OK, record)
-                        }
-                    }
-                }
-            }
 
 
         }
     }
 }
+
+private const val SHUTDOWN_STOP_WAIT_MS = 7_000L

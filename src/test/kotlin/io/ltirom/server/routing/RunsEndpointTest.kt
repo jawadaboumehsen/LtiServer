@@ -33,7 +33,8 @@ class RunsEndpointTest {
             environment: Map<String, String>,
             stdinText: String?,
             timeoutMs: Long,
-            onOutput: ((stdoutLine: String, stderrLine: String) -> Unit)?
+            onOutput: ((stdoutLine: String, stderrLine: String) -> Unit)?,
+            executionId: String?
         ): ProcessExecutionResult {
             return ProcessExecutionResult(0, "ok", "", 10L)
         }

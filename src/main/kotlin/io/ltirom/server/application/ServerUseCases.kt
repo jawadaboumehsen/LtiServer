@@ -16,7 +16,10 @@ public class ExecuteToolUseCase(
     private val resolver: ToolResolverPort,
     private val processRunner: ProcessExecutionPort
 ) {
-    public suspend fun execute(request: ToolExecutionRequest): ToolExecutionResponse {
+    public suspend fun execute(
+        request: ToolExecutionRequest,
+        executionId: String? = null
+    ): ToolExecutionResponse {
         val resolved = resolver.resolve(request.toolId)
             ?: return ToolExecutionResponse(
                 exitCode = -1,
@@ -42,7 +45,8 @@ public class ExecuteToolUseCase(
                 workingDir = workingDir,
                 environment = request.environment,
                 stdinText = request.stdinText,
-                timeoutMs = request.timeoutMs
+                timeoutMs = request.timeoutMs,
+                executionId = executionId
             )
 
             ToolExecutionResponse(
@@ -51,6 +55,8 @@ public class ExecuteToolUseCase(
                 stderr = result.stderr,
                 durationMs = result.durationMs
             )
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            throw ce
         } catch (e: Exception) {
             ToolExecutionResponse(
                 exitCode = -1,
@@ -71,6 +77,7 @@ public class StreamToolUseCase(
 ) {
     public suspend fun stream(
         request: ToolExecutionRequest,
+        executionId: String? = null,
         emitEvent: suspend (StreamEvent) -> Unit
     ) {
         val resolved = resolver.resolve(request.toolId)
@@ -94,14 +101,18 @@ public class StreamToolUseCase(
                 workingDir = workingDir,
                 environment = request.environment,
                 stdinText = request.stdinText,
-                timeoutMs = request.timeoutMs
+                timeoutMs = request.timeoutMs,
+                executionId = executionId
             ).collect { chunk ->
                 when (chunk) {
+                    is ProcessOutputChunk.Started -> Unit
                     is ProcessOutputChunk.Stdout -> emitEvent(StreamEvent.OutputChunk(chunk.line, isError = false))
                     is ProcessOutputChunk.Stderr -> emitEvent(StreamEvent.OutputChunk(chunk.line, isError = true))
                     is ProcessOutputChunk.Exit -> emitEvent(StreamEvent.ExecutionFinished(exitCode = chunk.exitCode, durationMs = chunk.durationMs))
                 }
             }
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            throw ce
         } catch (e: Exception) {
             emitEvent(StreamEvent.OutputChunk(e.message ?: "Execution failed", isError = true))
             emitEvent(StreamEvent.ExecutionFinished(exitCode = -1, durationMs = 0L, summary = e.message))

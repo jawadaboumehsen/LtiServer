@@ -30,6 +30,7 @@ class AttachAndCancelTest {
         val allowComplete = CompletableDeferred<Unit>()
         val cancelCalled = CompletableDeferred<String>()
         var isProcessRunning = false
+        var cancellationConfirmed = true
 
         override suspend fun runProcess(
             toolName: String,
@@ -38,7 +39,8 @@ class AttachAndCancelTest {
             environment: Map<String, String>,
             stdinText: String?,
             timeoutMs: Long,
-            onOutput: ((stdoutLine: String, stderrLine: String) -> Unit)?
+            onOutput: ((stdoutLine: String, stderrLine: String) -> Unit)?,
+            executionId: String?
         ): ProcessExecutionResult = ProcessExecutionResult(0, "ok", "", 10L)
 
         override fun runProcessFlow(
@@ -51,19 +53,22 @@ class AttachAndCancelTest {
             executionId: String?
         ): Flow<ProcessOutputChunk> = flow {
             isProcessRunning = true
-            processStarted.complete(Unit)
-            emit(ProcessOutputChunk.Stdout("line 1"))
-            emit(ProcessOutputChunk.Stdout("line 2"))
-            allowComplete.await()
-            emit(ProcessOutputChunk.Stdout("line 3"))
-            emit(ProcessOutputChunk.Exit(0, 50L))
-            isProcessRunning = false
+            try {
+                processStarted.complete(Unit)
+                emit(ProcessOutputChunk.Stdout("line 1"))
+                emit(ProcessOutputChunk.Stdout("line 2"))
+                allowComplete.await()
+                emit(ProcessOutputChunk.Stdout("line 3"))
+                emit(ProcessOutputChunk.Exit(0, 50L))
+            } finally {
+                isProcessRunning = false
+            }
         }
 
         override fun cancelProcess(executionId: String, signal: String): Boolean {
             cancelCalled.complete(signal)
             allowComplete.complete(Unit)
-            return true
+            return cancellationConfirmed
         }
 
     }
@@ -94,6 +99,32 @@ class AttachAndCancelTest {
             configureRoutes(config)
         }
         return Pair(runner, config)
+    }
+
+    @Test
+    fun `legacy cancel HTTP 200 preserves false when termination is unconfirmed`() = testApplication {
+        val runner = TestProcessRunner().apply { cancellationConfirmed = false }
+        setupTestApp(runner)
+        val response = client.post("/api/v1/tools/execute/missing/cancel") {
+            header(HttpHeaders.Authorization, "Bearer $testToken")
+        }
+        assertEquals(HttpStatusCode.OK, response.status)
+        val body = json.decodeFromString<ProcessCancellationResponse>(response.bodyAsText())
+        assertFalse(body.success)
+        assertEquals("missing", body.executionId)
+        assertTrue(body.message.orEmpty().contains("not confirmed"))
+    }
+
+    @Test
+    fun `legacy cancel response describes terminal acknowledgement not signal dispatch`() = testApplication {
+        setupTestApp()
+        val response = client.post("/api/v1/tools/execute/confirmed/cancel") {
+            header(HttpHeaders.Authorization, "Bearer $testToken")
+        }
+        val body = json.decodeFromString<ProcessCancellationResponse>(response.bodyAsText())
+        assertTrue(body.success)
+        assertEquals("confirmed", body.executionId)
+        assertTrue(body.message.orEmpty().contains("confirmed terminated"))
     }
 
     @Test

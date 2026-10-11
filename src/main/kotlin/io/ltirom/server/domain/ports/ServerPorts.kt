@@ -8,13 +8,21 @@ public data class ProcessExecutionResult(
     val exitCode: Int,
     val stdout: String,
     val stderr: String,
-    val durationMs: Long
+    val durationMs: Long,
+    val survivors: List<Long> = emptyList()
 )
 
 public sealed interface ProcessOutputChunk {
+    /** The process exists: who it is, so a restarted service can find it again. */
+    public data class Started(val pid: Long, val startedAtEpochMs: Long?) : ProcessOutputChunk
+
     public data class Stdout(val line: String) : ProcessOutputChunk
     public data class Stderr(val line: String) : ProcessOutputChunk
-    public data class Exit(val exitCode: Int, val durationMs: Long) : ProcessOutputChunk
+    public data class Exit(
+        val exitCode: Int,
+        val durationMs: Long,
+        val survivors: List<Long> = emptyList()
+    ) : ProcessOutputChunk
 }
 
 /**
@@ -48,7 +56,8 @@ public interface ProcessExecutionPort {
         environment: Map<String, String> = emptyMap(),
         stdinText: String? = null,
         timeoutMs: Long = 900_000L,
-        onOutput: ((stdoutLine: String, stderrLine: String) -> Unit)? = null
+        onOutput: ((stdoutLine: String, stderrLine: String) -> Unit)? = null,
+        executionId: String? = null
     ): ProcessExecutionResult
 
     public fun runProcessFlow(
@@ -66,7 +75,8 @@ public interface ProcessExecutionPort {
             workingDir = workingDir,
             environment = environment,
             stdinText = stdinText,
-            timeoutMs = timeoutMs
+            timeoutMs = timeoutMs,
+            executionId = executionId
         )
         if (result.stdout.isNotEmpty()) {
             result.stdout.lines().forEach { emit(ProcessOutputChunk.Stdout(it)) }
@@ -80,7 +90,11 @@ public interface ProcessExecutionPort {
 
 /**
  * Port for cancelling running processes by execution ID.
+ * The blocking compatibility API returns true only after bounded observation confirms the
+ * original process and its tracked descendants are terminal. Unknown IDs, failure and
+ * expiry return false; successful signal dispatch alone is not an acknowledgement.
  */
 public interface ProcessCancellationPort {
     public fun cancelProcess(executionId: String, signal: String = "SIGTERM"): Boolean
+    public fun getSurvivors(executionId: String): List<Long> = emptyList()
 }

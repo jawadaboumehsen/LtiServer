@@ -36,6 +36,7 @@ class AdmissionHoldsTest {
             stdinText: String?,
             timeoutMs: Long,
             onOutput: ((stdoutLine: String, stderrLine: String) -> Unit)?,
+            executionId: String?
         ): ProcessExecutionResult = awaitCancellation()
     }
 
@@ -68,29 +69,6 @@ class AdmissionHoldsTest {
         assertIs<RunStartOutcome.Created>(engine.startRun(request("r2")))
     }
 
-    @Test
-    fun `activation early exit never removes SHUTDOWN hold`() = runBlocking<Unit> {
-        val engine = DefaultServerEngine(FakeResolver(), BlockingRunner(), "Ubuntu-Test")
-
-        engine.addHold(Hold.Shutdown)
-
-        val activationHold = Hold.Activation("act-123")
-        engine.addHold(activationHold)
-        assertEquals(setOf(Hold.Shutdown, activationHold), engine.admissionHolds)
-
-        // Simulating early exit / failure in activation transaction: removes only its own hold
-        engine.removeHold(activationHold)
-
-        assertEquals(setOf(Hold.Shutdown), engine.admissionHolds)
-        assertEquals(RunStartOutcome.ShuttingDown, engine.startRun(request("r1")))
-        assertFailsWith<ServiceShuttingDownException> { engine.execute(request("e1").request) }
-
-        // Finally remove shutdown
-        engine.removeHold(Hold.Shutdown)
-        assertTrue(engine.admissionHolds.isEmpty())
-        assertIs<RunStartOutcome.Created>(engine.startRun(request("r3")))
-    }
-
     private suspend fun awaitActive(engine: DefaultServerEngine, count: Int) = withTimeout(5_000) {
         while (engine.getHealth().activeRuns != count) delay(10)
     }
@@ -101,7 +79,7 @@ class AdmissionHoldsTest {
 
         assertIs<RunStartOutcome.Created>(engine.startRun(request("running-job")))
 
-        val activeWork = engine.tryAddHold(Hold.Activation("act-test"))
+        val activeWork = engine.tryAddHold(Hold.Shutdown)
         assertEquals(1, activeWork.size, "Active run should block the hold")
         assertTrue(engine.admissionHolds.isEmpty(), "Hold must NOT be added when active work exists")
 
@@ -113,9 +91,9 @@ class AdmissionHoldsTest {
     fun `atomic check no work and add hold succeeds when idle`() = runBlocking<Unit> {
         val engine = DefaultServerEngine(FakeResolver(), BlockingRunner(), "Ubuntu-Test")
 
-        val activeWork = engine.tryAddHold(Hold.Activation("act-test"))
+        val activeWork = engine.tryAddHold(Hold.Shutdown)
         assertTrue(activeWork.isEmpty(), "No active work: should return empty list")
-        assertEquals(setOf(Hold.Activation("act-test")), engine.admissionHolds)
+        assertEquals(setOf(Hold.Shutdown), engine.admissionHolds)
 
         // Now new runs are blocked
         assertEquals(RunStartOutcome.ShuttingDown, engine.startRun(request("blocked-job")))
@@ -128,7 +106,7 @@ class AdmissionHoldsTest {
         val job = launch(Dispatchers.Default) { engine.execute(request("x").request, "trace-leg") }
         awaitActive(engine, 1)
 
-        val activeWork = engine.tryAddHold(Hold.Activation("act-leg"))
+        val activeWork = engine.tryAddHold(Hold.Shutdown)
         assertEquals(listOf("execute:trace-leg"), activeWork)
         assertTrue(engine.admissionHolds.isEmpty(), "Hold must not be added while legacy work is running")
 
@@ -136,8 +114,8 @@ class AdmissionHoldsTest {
         job.join()
 
         // Once idle, hold addition succeeds
-        val idleWork = engine.tryAddHold(Hold.Activation("act-leg"))
+        val idleWork = engine.tryAddHold(Hold.Shutdown)
         assertTrue(idleWork.isEmpty())
-        assertEquals(setOf(Hold.Activation("act-leg")), engine.admissionHolds)
+        assertEquals(setOf(Hold.Shutdown), engine.admissionHolds)
     }
 }
