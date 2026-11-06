@@ -47,6 +47,11 @@ class ProcessRunnerCancellationTest {
     }
 
     @Test
+    fun `a group signal ends its options, or kill reaches processes outside the group`() {
+        assertEquals(listOf("kill", "-TERM", "--", "-42"), groupKillCommand("TERM", 42))
+    }
+
+    @Test
     fun `unknown cancellation is false and does not poison a later execution`() = runBlocking {
         org.junit.Assume.assumeTrue("Requires Linux /bin/sh", shell.canExecute())
         val runner = LinuxProcessRunner(resolver, ProcessResourceLimits(isolatedProcessGroup = false))

@@ -193,6 +193,12 @@ internal data class Survivor(val pid: Long, val startedAtMs: Long?) {
 
 private const val START_TOLERANCE_MS = 2_000L
 
+/**
+ * Signals the process group [pgid]. The `--` is required: procps-ng 4 `kill -TERM -<pid>` fails its target yet still
+ * signals unrelated processes, which took the build service and every other process of the user down with a cancel.
+ */
+internal fun groupKillCommand(signal: String, pgid: Long): List<String> = listOf("kill", "-$signal", "--", "-$pgid")
+
 /** Adds the live members of the session/group led by [rootPid] (other than [rootPid] itself) to [into]. */
 private fun addGroupMembers(rootPid: Long, into: MutableSet<ProcessHandle>) {
     listOf("-s", "-g").forEach { flag ->
@@ -581,7 +587,7 @@ public class LinuxProcessRunner(
             val rootPid = runCatching { p?.pid() }.getOrNull()
             if (rootPid != null) {
                 runCatching {
-                    val kp = ProcessBuilder("kill", "-$sig", "--", "-$rootPid").start()
+                    val kp = ProcessBuilder(groupKillCommand(sig, rootPid)).start()
                     kp.waitFor(200, TimeUnit.MILLISECONDS)
                 }
             }
@@ -636,7 +642,7 @@ public class LinuxProcessRunner(
                     if (p?.isAlive == true) p.destroyForcibly()
                     if (rootPid != null) {
                         runCatching {
-                            val kp = ProcessBuilder("kill", "-KILL", "--", "-$rootPid").start()
+                            val kp = ProcessBuilder(groupKillCommand("KILL", rootPid)).start()
                             kp.waitFor(200, TimeUnit.MILLISECONDS)
                         }
                     }
@@ -781,7 +787,7 @@ public class LinuxProcessRunner(
         // by signalling the group itself.
         if (pid != null && (process.isAlive || limits.isolatedProcessGroup)) {
             runCatching {
-                val kp = ProcessBuilder("kill", "-TERM", "-$pid").start()
+                val kp = ProcessBuilder(groupKillCommand("TERM", pid)).start()
                 kp.waitFor(500, TimeUnit.MILLISECONDS)
                 if (kp.isAlive) {
                     kp.destroyForcibly()
@@ -800,7 +806,7 @@ public class LinuxProcessRunner(
 
         if (pid != null && (process?.isAlive == true || limits.isolatedProcessGroup)) {
             runCatching {
-                val kp = ProcessBuilder("kill", "-KILL", "-$pid").start()
+                val kp = ProcessBuilder(groupKillCommand("KILL", pid)).start()
                 kp.waitFor(500, TimeUnit.MILLISECONDS)
                 if (kp.isAlive) {
                     kp.destroyForcibly()
